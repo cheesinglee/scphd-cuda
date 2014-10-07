@@ -49,6 +49,7 @@ CUDA_GCC_BINDIR=/opt/gcc-4.8
 #CUDA_GCC_BINDIR=/usr/lib/nvidia-cuda-toolkit/bin
 NVCCFLAGS = \
     -std=c++11 \
+    --generate-line-info \
     --compiler-options -fno-strict-aliasing\
     --compiler-bindir=$$CUDA_GCC_BINDIR  \
     --ptxas-options=-O2,-v\

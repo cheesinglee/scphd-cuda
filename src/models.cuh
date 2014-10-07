@@ -52,7 +52,7 @@ public:
         }
     }
 
-    __device__ G operator() (G daughter, double* parent){
+    __device__ __host__ G operator() (G daughter, double* parent){
         G predicted = daughter ;
         for (int i = 0 ; i < N ; i++ ){
             predicted.cov[i*i] += sigma[i] ;

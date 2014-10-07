@@ -4,6 +4,7 @@
 #include <string>
 #include <ctime>
 #include <iostream>
+#include <sstream>
 #include <fstream>
 #include <cuda_runtime.h>
 #include "models.cuh"
@@ -44,23 +45,28 @@ int main(int argc, char* argv[])
     double pruneWeight = root["pruneWeight"].asDouble() ;
     double mergeDist = root["mergeDist"].asDouble() ;
 
-    double sigma[2] = {1.0,1.0} ;
-    double R[4] = {1.0,0.0,0.0,1.0} ;
+
+
+    string sigmaStr = root["sigmaparent"].asString() ;
+    stringstream sigmaSS(sigmaStr) ;
+    double sigma[2] ;
+    sigmaSS >> sigma[0] >> sigma[1] ;
     BrownianMotionParentModel<2> parentModel(sigma) ;
+
+    sigmaStr = root["sigmadaughter"].asString() ;
+    sigmaSS.str(sigmaStr) ;
+    sigmaSS >> sigma[0] >> sigma[1] ;
     BrownianMotionDaughterModel<2,Gaussian2D> daughterModel(sigma) ;
-    BiasedIdentityModel<2> measurementModel(R,0.98) ;
+
+
+    string Rstr = root["R"].asString() ;
+    stringstream Rss(Rstr) ;
+    double R[4] ;
+    Rss >> R[0] >> R[1] >> R[2] >> R[3] ;
+    BiasedIdentityModel<2> measurementModel(R,pd) ;
 
     // seed RNG - don't forget this!
     srand(time(NULL)) ;
-
-    // check cuda device properties
-    int nDevices ;
-    cudaGetDeviceCount( &nDevices ) ;
-    cout << "Found " << nDevices << " CUDA Devices" << endl ;
-    cudaDeviceProp props ;
-    cudaGetDeviceProperties( &props, 0 ) ;
-    cout << "Device name: " << props.name << endl ;
-    cout << "Compute capability: " << props.major << "." << props.minor << endl ;
 
     SCPHDFilter<2,Gaussian2D,2,BrownianMotionParentModel<2>,BrownianMotionDaughterModel<2,Gaussian2D>,BiasedIdentityModel<2>>
     filter(nParticles,ps,pd,w0,kappa,pruneWeight,mergeDist,
@@ -74,12 +80,13 @@ int main(int argc, char* argv[])
     for (int k = 0 ; k < nSteps ; k++){
         cout << "k = " << k << endl ;
         vector < vector<double> > Z = measurements[k] ;
-//        cout << "predict" << endl ;
+        cout << "predict" << endl ;
         filter.predict();
-//        cout << "update" << endl ;
+        cout << "update" << endl ;
         filter.update(Z);
-//        cout << "resample" << endl ;
+        cout << "daughter estimate" << endl ;
         est = filter.daughterEstimate() ;
+
         filter.resample();
     }
     vector<Gaussian2D>::iterator it ;

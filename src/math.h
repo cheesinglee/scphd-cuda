@@ -62,6 +62,7 @@ void matmultiply(double* A, double* B, double* X){
             for (int k = 0 ; k < COLS_A ; k++){
                 val += A[i + k*ROWS_A]*B[k + j*COLS_A] ;
             }
+            X[i+j*ROWS_A] = val ;
         }
     }
 }
@@ -382,7 +383,7 @@ ekfUpdate(Gaussian<N,N2> predicted,double* innovation,double* H,double* R){
     Gaussian<N,N2> updated ;
     // xupdate = xpredicted + K*v
     for (int i = 0 ; i < N ; i++){
-        updated.mean[i] = predicted.mean[0] ;
+        updated.mean[i] = predicted.mean[i] ;
         for (int m = 0 ; m < M ; m++){
             updated.mean[i] += innovation[m]*K[i+m*N] ;
         }

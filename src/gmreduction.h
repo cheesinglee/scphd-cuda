@@ -4,6 +4,7 @@
 #include <vector>
 #include <list>
 #include <algorithm>
+#include <nvToolsExtCuda.h>
 #include "math.h"
 #include "types.h"
 
@@ -22,6 +23,8 @@ public:
 
 template <class G>
 bool weightSortPredicate(G a, G b) { return a.weight >= b.weight ;}
+
+bool isFalse(bool b) { return !b; }
 
 //bool weightSortPredicate(Gaussian2D a, Gaussian2D b) { return (a.weight >= b.weight) ;}
 
@@ -70,38 +73,72 @@ Gaussian<N,N2> mergeGaussians(list< Gaussian<N,N2> > gaussians){
 }
 
 template <class G>
-vector<G> reduceGaussianMixture(vector<G> gm, double minWeight, double minDist){
+vector<G> reduceGaussianMixture(vector<G> gm,
+                                double minWeight, double minDist){
 //    int verbosity_ = 3 ;
 
-    // copy gaussian vector to linked list
-    list<G> pruned(gm.begin(),gm.end()) ;
+
+
+//    // mark pruned features
+//    for (int i = 0 ; i < N ; i++){
+//        mergedFlags[i] = (gm[i].weight < minWeight) ;
+//    }
+
+    // prune and copy gaussian vector
+    vector<G> pruned ;
+    for ( int i = 0 ; i < gm.size() ; i++){
+        G feature = gm[i] ;
+        if (feature.weight > minWeight){
+            pruned.push_back(feature);
+        }
+    }
 //    DEBUG_VAL(pruned.size()) ;
 
-    // prune terms with low weight
-    weightPredicate<G> prunePred(minWeight) ;
-//    DEBUG_MSG("perform pruning") ;
-    pruned.remove_if(prunePred) ;
-//    DEBUG_VAL(pruned.size()) ;
+    // flag array to keep track of what has been merged
+    int N = pruned.size() ;
+    vector<bool> mergedFlags(N,false) ;
 
-    // sort terms by descending weight
-    pruned.sort(weightSortPredicate<G>);
+    // compute distance matrix
+    nvtxRangePushA("Compute merge distances") ;
+    vector< vector<double> > distances(N) ;
+    for ( int row = 0 ; row < N ; row++){
+        distances[row].resize(N,0.0) ;
+        for (int col = 0 ; col < N ; col++){
+            if (col < row){
+                G g1 = pruned[row] ;
+                G g2 = pruned[col] ;
+                double dist = computeMahalDist(g1,g2) ;
+                distances[row][col] = dist ;
+                distances[col][row] = dist ;
+            }
+        }
+    }
+    nvtxRangePop() ;
+
+
 
     typename list<G>::iterator it ;
     vector<G> merged ;
-    while(pruned.size() > 0){
-        G maxTerm = pruned.front();
-        pruned.pop_front();
+    while(any_of(mergedFlags.begin(),mergedFlags.end(),isFalse)){
+        // find the max term
+        int maxIdx = 0 ;
+        double maxWeight = -1 ;
+        for ( int i = 0 ; i < N ; i++){
+            if (pruned[i].weight > maxWeight && !mergedFlags[i]){
+                maxWeight = pruned[i].weight ;
+                maxIdx = i ;
+            }
+        }
+        G maxTerm = pruned[maxIdx] ;
+        mergedFlags[maxIdx] = true ;
         list<G> toMerge ;
         toMerge.push_back(maxTerm) ;
-//        for (it = pruned.begin() ; it != pruned.end() ; it++)?
-        it = pruned.begin() ;
-        while( it != pruned.end()){
-            double dist = computeMahalDist(maxTerm,*it) ;
-            if (dist < minDist){
-                toMerge.push_back(*it);
-                it = pruned.erase(it) ;
+        for (int j = 0 ; j < N ; j++){
+            double dist = distances[maxIdx][j] ;
+            if (dist < minDist && !mergedFlags[j]){
+                toMerge.push_back(pruned[j]);
+                mergedFlags[j] = true ;
             }
-            it++ ;
         }
         if (toMerge.size() == 1){
             merged.push_back(maxTerm);

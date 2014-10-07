@@ -1,9 +1,12 @@
 {
-  "nParticles" : 200,
+  "nParticles" : 10000,
   "pruneWeight" : 0.00001,
-  "minDist" : 10,
-  "pd":0.95,
-  "ps":0.98,
+  "minDist" : 13,
+  "pd":0.9,
+  "ps":1.0,
   "w0":0.0001,
-  "kappa":0.01
+  "kappa":0.1,
+  "R": "0.05 0.0 0.0 0.05",
+  "sigmaparent" : "0.1 0.1",
+  "sigmadaughter" : "0.05 0.05"
 }

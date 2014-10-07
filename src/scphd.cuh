@@ -3,6 +3,10 @@
 
 #include <vector>
 #include <ctime>
+#include <thread>
+#include <future>
+#include <nvToolsExtCuda.h>
+
 #include "kernels.cuh"
 #include "types.h"
 #include "gmreduction.h"
@@ -10,6 +14,16 @@
 
 #define DEBUG_MSG(x) if ( verbosity_ >= 2) cout << "[" << __func__ << "(" << __LINE__ << ")]: " << x << endl
 #define DEBUG_VAL(x) if ( verbosity_ >= 2) cout << "[" << __func__ << "(" << __LINE__ << ")]: " << #x << " = " << x << endl
+
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
 
 using namespace std ;
 
@@ -44,6 +58,7 @@ class SCPHDFilter{
 public:
     vector< vector<double> > parent ;
     vector< vector<G> > daughter ;
+    vector< vector< vector<double> > > distances ;
     vector<double> parentWeights ;
     int parentDim ;
     int nParticles ;
@@ -56,6 +71,7 @@ public:
     double pruneWeight ;
     double mergeDist ;
     double minNeff ;
+    size_t maxGlobalMem ;
 
     ParentMM parentMotionModel ;
     DaughterMM daughterMotionModel ;
@@ -75,18 +91,25 @@ public:
         minNeff = 0.5 ;
         verbosity_ = 3 ;
 
+        nDaughter = 0 ;
+        nMeasure = 0 ;
+        dOffsets = NULL ;
+        dDaughter = NULL ;
+        dParent = NULL ;
+        dMeasurements = NULL ;
 
-
+        initializeGPU() ;
         initializeParent(nParticles);
         initializeDaughter(nParticles) ;
         offsets.assign(nParticles+1,0);
+        distances.resize(nParticles);
     }
 
 
     ~SCPHDFilter(){
-        cudaFree((void*)dParent) ;
-        cudaFree((void*)dDaughter) ;
-        cudaFree((void*)dMeasurements) ;
+        gpuErrchk(cudaFree((void*)dParent)) ;
+        gpuErrchk(cudaFree((void*)dDaughter)) ;
+        gpuErrchk(cudaFree((void*)dMeasurements)) ;
     }
 
     void predict(){
@@ -96,8 +119,10 @@ public:
 //        cout << "computeOffsets" << endl ;
         computeOffsets() ;
 
-//        cout << "copyDaughter" << endl ;
+        cout << "copyDaughter" << endl ;
+        DEBUG_VAL(nDaughter) ;
         copyDaughter() ;
+        DEBUG_VAL(nDaughter) ;
 
         int gridDim = nParticles ;
         int blockDim = 256 ;
@@ -105,6 +130,9 @@ public:
         daughterPredictKernel<G,DaughterMM,N><<<gridDim,blockDim>>>(dDaughter,dParent,
                                                   daughterMotionModel,
                                                   dOffsets, nParticles) ;
+        gpuErrchk(cudaPeekAtLastError()) ;
+//        gpuErrchk(cudaDeviceSynchronize()) ;
+        readDaughterPredict(dDaughter);
         copyParent();
     }
 
@@ -114,100 +142,227 @@ public:
         dim3 gridDim ;
         dim3 blockDim ;
 
-        // compute births
-        G* dBirths ;
-        size_t birthSize = sizeof(G)*nParticles*nMeasure ;
-        cudaMalloc((void**)&dBirths,birthSize) ;
-        gridDim.x = nParticles ;
-        blockDim.x = 256 ;
+        vector<size_t> requiredMemory = computeRequiredMemory() ;
+        int startIdx = 0 ;
+        int endIdx = 0 ;
 
-        computeBirthsKernel<G,MeasureModel,N,M><<<gridDim,blockDim>>>
-            (dMeasurements,dParent,measureModel,w0,nMeasure,nParticles,
-             dBirths) ;
+        size_t memfree ;
+        size_t total ;
+        size_t batchBytes ;
 
-//        // peek births
-//        vector<G> births(nParticles*nMeasure) ;
-//        cudaMemcpy(&births[0],dBirths,birthSize,cudaMemcpyDeviceToHost) ;
-//        for ( int  i = 0 ; i < nMeasure ; i++){
-//            print_feature<N>(births[i]) ;
-//        }
+        while (endIdx < nParticles){
+            gpuErrchk(cudaMemGetInfo(&memfree,&total)) ;
+            batchBytes = 0 ;
+            startIdx = endIdx ;
+            while(batchBytes < 0.9*memfree){
+                batchBytes += requiredMemory[endIdx++] ;
+                if (endIdx == nParticles)
+                    break ;
+            }
 
-        // compute detections
-        G* dDetections ;
-        size_t detectionSize = nMeasure*nDaughter*nParticles*sizeof(G) ;
-        cudaMalloc((void**)&dDetections,detectionSize) ;
-        blockDim.x = 32 ;
-        blockDim.y = 32 ;
-        computeDetectionsKernel<G,MeasureModel,N,M><<<gridDim,blockDim>>>
-            (dParent,dDaughter,dMeasurements, measureModel, dOffsets,
-             nMeasure,nDaughter,dDetections) ;
-        cudaDeviceSynchronize() ;
+            DEBUG_VAL(startIdx) ;
+            DEBUG_VAL(endIdx) ;            
 
-        // compute weight normalizers
-        double* dNormalizers = NULL ;
-        size_t normalizerSize = nMeasure*nParticles*sizeof(double) ;
-        cudaMalloc((void**)dNormalizers,normalizerSize) ;
-        gridDim.x = min(nParticles,1024) ;
-        gridDim.y = min(nMeasure,32) ;
-        blockDim.x = 256 ;
-        blockDim.y = 1 ;
-        DEBUG_VAL(normalizerSize/sizeof(double)) ;
-        DEBUG_VAL(nParticles) ;
-        DEBUG_VAL(nMeasure) ;
-        DEBUG_VAL(w0) ;
-        DEBUG_VAL(kappa) ;
-        computeNormalizersKernel<<<gridDim,blockDim>>>
-            (dDetections,w0,kappa,dOffsets,nParticles,nMeasure,dNormalizers) ;
-        cudaDeviceSynchronize() ;
+            DEBUG_VAL(batchBytes) ;
+            DEBUG_VAL(memfree) ;
 
-        // re-weight parent particles
-        vector<double> normalizers(nMeasure*nParticles,1.0) ;
-//        cudaMemcpy(&normalizers[0],dNormalizers
-//                   ,normalizerSize,cudaMemcpyDeviceToHost) ;
-        for (int i = 0 ; i < nParticles ; i++){
-            for (int m = 0 ; m < nMeasure ; m++){
-                if (i == 0){
-//                    DEBUG_VAL(normalizers[m]) ;
+            computeOffsets(startIdx,endIdx);
+            copyParent(startIdx,endIdx);
+            copyDaughter(startIdx,endIdx);
+            int batchParticles = endIdx - startIdx ;
+
+            DEBUG_VAL(batchParticles) ;
+            DEBUG_VAL(nDaughter) ;
+            DEBUG_VAL(nMeasure) ;
+
+//            for (int i = startIdx ; i < endIdx ; i++){
+//                cout << "offset["<<i<<"] = " << offsets[i] << endl ;
+//            }
+
+            G* dUpdate ;
+            size_t updateSize = sizeof(G)*(batchParticles*nMeasure +
+                                           nMeasure*nDaughter +
+                                           nDaughter) ;
+            gpuErrchk(cudaMalloc((void**)&dUpdate,updateSize)) ;
+
+            // compute births
+            if (nMeasure > 0){
+                DEBUG_MSG("births") ;
+                gridDim.x = batchParticles ;
+                gridDim.y = 1 ;
+                blockDim.x = 256 ;
+                blockDim.y = 1;
+
+                computeBirthsKernel<G,MeasureModel,N,M><<<gridDim,blockDim>>>
+                    (dMeasurements,dParent,measureModel,w0,
+                     dOffsets,nMeasure,dUpdate) ;
+                gpuErrchk(cudaPeekAtLastError()) ;                
+//                gpuErrchk(cudaDeviceSynchronize()) ;
+            }
+
+
+            // compute detections
+            if (nDaughter > 0){
+                DEBUG_MSG("detections") ;
+                gridDim.x = batchParticles ;
+                blockDim.x = 32 ;
+                blockDim.y = 32 ;
+                computeDetectionsKernel<G,MeasureModel,N,M><<<gridDim,blockDim>>>
+                    (dParent,dDaughter,dMeasurements, measureModel,
+                     dOffsets,nMeasure,dUpdate) ;
+                gpuErrchk(cudaPeekAtLastError()) ;
+//                gpuErrchk(cudaDeviceSynchronize()) ;
+            }
+
+            // compute weight normalizers
+            double* dNormalizers = NULL ;
+            size_t normalizerSize = nMeasure*batchParticles*sizeof(double) ;
+            gpuErrchk(cudaMalloc((void**)&dNormalizers,normalizerSize)) ;
+            if (nDaughter > 0){
+                DEBUG_MSG("normalizers") ;
+                gridDim.x = min(batchParticles,1024) ;
+                gridDim.y = min(nMeasure,32) ;
+                blockDim.x = 256 ;
+                blockDim.y = 1 ;
+                computeNormalizersKernel<G><<<gridDim,blockDim>>>
+                    (dUpdate,w0,kappa,dOffsets,batchParticles,
+                     nMeasure,dNormalizers) ;
+                gpuErrchk(cudaPeekAtLastError()) ;
+//                gpuErrchk(cudaDeviceSynchronize()) ;
+
+            }
+            else{
+                DEBUG_MSG("compute normalizers without detection terms") ;
+                vector<double> hNormalizers(nMeasure*batchParticles,w0+kappa) ;
+                gpuErrchk(cudaMemcpy(dNormalizers,&hNormalizers[0],normalizerSize,
+                        cudaMemcpyHostToDevice)) ;
+            }
+
+            // re-weight parent particles
+            DEBUG_MSG("weight parents") ;
+            vector<double> normalizers(nMeasure*batchParticles,1.0) ;
+            gpuErrchk(cudaMemcpy(&normalizers[0],dNormalizers,
+                                 normalizerSize,cudaMemcpyDeviceToHost)) ;
+
+            for (int i = startIdx ; i < endIdx ; i++){
+                for (int m = 0 ; m < nMeasure ; m++){
+                    int idx = (i-startIdx)*nMeasure + m ;
+                    parentWeights[i] *= normalizers[idx] ;
                 }
-                parentWeights[i] *= normalizers[nMeasure*i+m] ;
+                double cnPredict = 0 ;
+                for (int j = 0 ; j < daughter[i].size() ; j++){
+                    cnPredict += daughter[i][j].weight ;
+                }
+                parentWeights[i] *= exp(-cnPredict) ;
             }
-            double cnPredict = 0 ;
-            for (int j = 0 ; j < daughter[i].size() ; j++){
-                cnPredict += daughter[i][j].weight ;
-            }
-            parentWeights[i] *= exp(-cnPredict) ;
+
+            // do the update
+            DEBUG_MSG("complete update") ;
+            gridDim.x = batchParticles ;
+            gridDim.y = 1 ;
+            blockDim.x = 256 ;
+            blockDim.y = 1 ;
+            updateKernel<G><<<gridDim,blockDim>>>
+                (dDaughter,dNormalizers, pd,
+                 dOffsets, nMeasure, dUpdate) ;
+            gpuErrchk(cudaPeekAtLastError()) ;
+//            gpuErrchk(cudaDeviceSynchronize()) ;
+
+//            // compute distances for GM reduction
+//            int nUpdateSquared = 0 ;
+//            for (int n = startIdx ; n < endIdx ; n++){
+//                int m = daughter[n].size()*(nMeasure+1) + nMeasure ;
+//                nUpdateSquared += m*m ;
+//                distances[n].resize(m) ;
+//                for ( int k = 0 ; k < m ; k++){
+//                    distances[n][k].assign(m,0.0) ;
+//                }
+//            }
+//            double* dDistances = NULL ;
+//            gpuErrchk(cudaMalloc((void**)&dDistances,
+//                                 nUpdateSquared*sizeof(double))) ;
+
+
+//            gridDim.x = batchParticles ;
+//            gridDim.y = 1 ;
+//            blockDim.x = 32 ;
+//            blockDim.y = 32 ;
+//            computeDistances<G><<<gridDim,blockDim>>>(dUpdate,dOffsets,
+//                                                      nMeasure,dDistances) ;
+//            gpuErrchk(cudaPeekAtLastError()) ;
+//            gpuErrchk(cudaDeviceSynchronize()) ;
+
+//            double* ptr = dDistances ;
+//            for (int n = startIdx ; n < endIdx ; n++){
+//                int m = distances[n].size() ;
+//                for (int k = 0 ; k < m ; k++){
+//                    gpuErrchk(cudaMemcpy(distances[n][k].data(),ptr,
+//                                         m*sizeof(double),cudaMemcpyDeviceToHost)) ;
+//                    ptr += m ;
+//                }
+//            }
+
+
+            DEBUG_MSG("copy daughter to host") ;
+            readDaughterUpdate(dUpdate,startIdx,endIdx);
+
+
+            // free memory
+            DEBUG_MSG("cudaFree") ;
+            gpuErrchk(cudaFree(dUpdate)) ;
+            gpuErrchk(cudaFree(dNormalizers)) ;
+//            gpuErrchk(cudaFree(dDistances)) ;
         }
-
-        // do the update
-        G* dUpdate ;
-        size_t updateSize = birthSize + detectionSize + nDaughter ;
-        cudaMalloc((void**)&dUpdate,updateSize) ;
-
-        gridDim.x = nParticles ;
-        gridDim.y = 1 ;
-        blockDim.x = 256 ;
-        blockDim.y = 1 ;
-        updateKernel<<<gridDim,blockDim>>>
-            (dDaughter,dDetections,dBirths,dNormalizers, pd,
-             dOffsets, nMeasure, dUpdate) ;
-        readDaughterUpdate(dUpdate);
-
-        for ( int i = 0 ; i < daughter[0].size() ; i++){
-            print_feature(daughter[0][i]) ;
-        }
-        cout << endl;
 
         // GM reduction
-        for (int n = 0 ; n < nParticles ; n++){
-            daughter[n] = reduceGaussianMixture<G>(daughter[n],pruneWeight,mergeDist) ;
+        DEBUG_MSG("reduce gaussian mixture") ;
+        int concurrency = thread::hardware_concurrency() ;
+        DEBUG_VAL(concurrency) ;
+        nvtxRangePushA("GM reduction") ;
+        if (concurrency > 2){
+            concurrency -= 1 ;
+            int n = 0 ;
+            vector< future< vector <G> > > futures ;
+            vector<G> (*fn)(vector<G>, double,double) ;
+            fn = &reduceGaussianMixture<G> ;
+            while ( n < nParticles){
+//                DEBUG_VAL(n) ;
+                // start threads
+                futures.clear();
+//                DEBUG_MSG("async") ;
+                for ( int i = 0 ; i < concurrency ; i++){
+                    if ( n < nParticles ){
+//                        DEBUG_VAL(distances[n].size()) ;
+//                        DEBUG_VAL(distances[n][0].size()) ;
+                        futures.push_back(async(launch::async,fn,daughter[n++],
+//                                                distances[n],
+                                                pruneWeight, mergeDist));
+                    }
+                    else{
+                        break ;
+                    }
+                }
+
+//                DEBUG_MSG("get") ;
+                // synchronize threads
+                n -= futures.size() ;
+                for ( int i = 0 ; i < concurrency ; i++){
+                    if (n < nParticles){
+                        daughter[n++] = futures[i].get() ;
+                    }
+                }
+            }
         }
+        else{
+            for (int n = 0 ; n < nParticles ; n++){
+                daughter[n] = reduceGaussianMixture<G>(daughter[n],
+//                                                       distances[n],
+                                                       pruneWeight,
+                                                       mergeDist) ;
+            }
+        }
+        nvtxRangePop() ;
 
-
-        // clean up
-        cudaFree(dNormalizers) ;
-        cudaFree(dDetections) ;
-        cudaFree(dBirths) ;
-        cudaFree(dUpdate) ;
     }
 
     double computeNeff(){
@@ -221,8 +376,13 @@ public:
     void resample(){
         double nEff = computeNeff() ;
         if (nEff >= minNeff)
+        {
+            cout << "not resampling" << endl ;
             return ;
+        }
 
+        nvtxRangeId_t rId = nvtxRangeStartA("Resample parent") ;
+        cout << "resampling" << endl ;
         vector<int> idxResample(nParticles) ;
         double interval = 1.0/nParticles ;
         double r = randu<double>() * interval ;
@@ -265,11 +425,12 @@ public:
             for (int n = 0 ; n < N ; n++){
                 resampledParent[n].push_back(parent[n][i]) ;
             }
-            resampledDaughter.push_back(daughter[j]);
+            resampledDaughter[j].assign(daughter[i].begin(),daughter[i].end()) ;
         }
         parent = resampledParent ;
         daughter = resampledDaughter ;
         parentWeights.assign(nParticles,interval);
+        nvtxRangeEnd(rId);
     }
 
     vector<double> getParticle(int idx){
@@ -289,11 +450,15 @@ public:
                 maxWeight = parentWeights[i] ;
             }
         }
-        vector<G> estimate ;
         vector<G> maxDaughter = daughter[maxIdx] ;
         DEBUG_VAL(maxDaughter.size()) ;
-        remove_copy_if(maxDaughter.begin(),maxDaughter.end(),
-                       estimate.begin(),weightBelow<G>) ;
+
+        vector<G> estimate(maxDaughter.size()) ;
+        typename vector<G>::iterator estimateEnd =
+                remove_copy_if(maxDaughter.begin(),maxDaughter.end(),
+                               estimate.begin(),weightBelow<G>) ;
+        estimate.resize(estimateEnd - estimate.begin());
+        DEBUG_VAL(estimate.size()) ;
         return estimate ;
     }
 
@@ -309,6 +474,22 @@ private:
     vector<int> offsets ;
     vector<G> concat ;
 
+    void initializeGPU(){
+        int nDevices ;
+        cudaGetDeviceCount( &nDevices ) ;
+        cout << "Found " << nDevices << " CUDA Devices" << endl ;
+        if (nDevices == 0){
+            cout << "No compatible devices found. Exiting." << endl ;
+            exit(-1) ;
+        }
+        cudaDeviceProp props ;
+        gpuErrchk(cudaGetDeviceProperties( &props, 0 )) ;
+        cout << "Device name: " << props.name << endl ;
+        cout << "Compute capability: " << props.major << "." << props.minor << endl ;
+        cout << "Total global memory: " << props.totalGlobalMem << endl ;
+        maxGlobalMem = props.totalGlobalMem ;
+    }
+
     void initializeParent(int nParticles, vector<double> initValue){
         parent.clear();
         parent.resize(N);
@@ -320,7 +501,7 @@ private:
         parentWeights.assign(nParticles, 1.0/nParticles);
 
         // allocate device memory for particles
-        cudaMalloc((void**) &dParent, nParticles*N*sizeof(double)) ;
+        gpuErrchk(cudaMalloc((void**) &dParent, nParticles*N*sizeof(double))) ;
 
         copyParent();
     }
@@ -334,40 +515,64 @@ private:
         daughter.resize(nParticles);
     }
 
-    void computeOffsets (){
-        vector<int> offsets(nParticles+1,0) ;
+    void computeOffsets(){
+        computeOffsets(0,nParticles);
+    }
+
+    void computeOffsets (int start, int end){
+        offsets.resize(end-start+1,0) ;
         int sum = 0 ;
-        for (int i = 0; i < nParticles ; i++){
+        for (int i = start; i < end ; i++){
             offsets[i] = sum ;
             sum += daughter[i].size() ;
         }
-        offsets[nParticles] = sum ;
+        offsets[end] = sum ;
 
-        size_t offsetSize = sizeof(int)*(nParticles+1) ;
-        cudaFree(dOffsets) ;
-        cudaMalloc((void**)&dOffsets,offsetSize) ;
-        cudaMemcpy(dOffsets,offsets.data(),offsetSize,cudaMemcpyHostToDevice) ;
+        size_t offsetSize = sizeof(int)*(end-start+1) ;
+        if (dOffsets != NULL)
+            gpuErrchk(cudaFree(dOffsets)) ;
+        gpuErrchk(cudaMalloc((void**)&dOffsets,offsetSize)) ;
+        gpuErrchk(cudaMemcpy(dOffsets,offsets.data(),offsetSize,cudaMemcpyHostToDevice)) ;
     }
 
     void copyParent(){
-        vector<double> flattened(N*nParticles) ;
+        copyParent(0,nParticles);
+    }
+
+    void copyParent(int start,int end){
+        int n = end - start ;
+        vector<double> flattened(N*n) ;
         for (int i = 0 ; i < N ; i++){
-            flattened.insert(flattened.end(),parent[i].begin(),parent[i].end()) ;
+            flattened.insert(flattened.end(),
+                             parent[i].begin()+start,
+                             parent[i].begin()+end) ;
         }
-        cudaMemcpy(dParent,flattened.data(),
-                   N*nParticles*sizeof(double),cudaMemcpyHostToDevice) ;
+        if (dParent != NULL)
+            gpuErrchk(cudaFree(dParent)) ;
+        gpuErrchk(cudaMalloc((void**)&dParent,N*n*sizeof(double)))
+        gpuErrchk(cudaMemcpy(dParent,flattened.data(),
+                   N*n*sizeof(double),cudaMemcpyHostToDevice)) ;
     }
 
     void copyDaughter(){
+        copyDaughter(0,nParticles);
+    }
+
+    void copyDaughter(int startIdx, int endIdx){
+        nvtxRangeId_t rId = nvtxRangeStartA("copyDaughter") ;
         concat.clear();
-        for (int i = 0 ; i < daughter.size() ; i++){
+        for (int i = startIdx ; i < endIdx ; i++){
+//            DEBUG_VAL(daughter[i].size()) ;
             concat.insert(concat.end(),daughter[i].begin(),daughter[i].end()) ;
         }
-        cudaFree(dDaughter) ;
+        if (dDaughter != NULL)
+            gpuErrchk(cudaFree(dDaughter)) ;
         nDaughter = concat.size() ;
-        size_t daughterSize = concat.size() * sizeof(G) ;
-        cudaMalloc( (void**)&dDaughter, daughterSize) ;
-        cudaMemcpy(dDaughter,concat.data(),daughterSize,cudaMemcpyHostToDevice) ;
+        size_t daughterSize = nDaughter * sizeof(G) ;
+        gpuErrchk(cudaMalloc( (void**)&dDaughter, daughterSize)) ;
+        gpuErrchk(cudaMemcpy(dDaughter,concat.data(),daughterSize,
+                             cudaMemcpyHostToDevice)) ;
+        nvtxRangeEnd(rId);
     }
 
     void copyMeasurements(vector<vector<double>> measurements){
@@ -379,23 +584,77 @@ private:
         }
         nMeasure = measurements[0].size() ;
         size_t measureSize = M*nMeasure*sizeof(double) ;
-        cudaFree(dMeasurements) ;
-        cudaMalloc((void**)&dMeasurements,measureSize) ;
-        cudaMemcpy(dMeasurements,measurementsFlattened.data(),measureSize,
-                   cudaMemcpyHostToDevice) ;
+        gpuErrchk(cudaFree(dMeasurements)) ;
+        gpuErrchk(cudaMalloc((void**)&dMeasurements,measureSize)) ;
+        gpuErrchk(cudaMemcpy(dMeasurements,measurementsFlattened.data(),
+                             measureSize,cudaMemcpyHostToDevice)) ;
     }
 
-    void readDaughterUpdate(G* dUpdate){
-        size_t updateSize = (nDaughter*(nMeasure+1) + nParticles*nMeasure) ;
-        concat.resize(updateSize);
-        cudaMemcpy(concat.data(),dUpdate,updateSize*sizeof(G),cudaMemcpyDeviceToHost) ;
-        typename vector< G >::iterator start ;
-        typename vector< G >::iterator stop ;
+    vector<size_t> computeRequiredMemory(){
+        vector<size_t> requiredMemory(nParticles) ;
+//        size_t sum = nDaughter*sizeof(G) ; // predicted daughter
+//        sum += N*nParticles*sizeof(double) ; // parent particles
+//        sum += M*sizeof(double) ; // measurements
+        size_t sum = 0 ;
         for ( int i = 0 ; i < nParticles ; i++){
-            start = concat.begin() + (nMeasure+1)*offsets[i] + nMeasure*i ;
-            stop = concat.begin() + (nMeasure+1)*offsets[i+1] + nMeasure*(i+1) ;
-            daughter[i].assign(start,stop) ;
+            int nFeatures = daughter[i].size() ;
+            int nUpdate = nFeatures*(nMeasure+1) + nMeasure ;
+            sum = nUpdate*sizeof(G)
+                + (N // parent particle
+//                + nUpdate*nUpdate // merge distances
+                + nMeasure) // normalizers
+                *sizeof(double)
+                + sizeof(int) ;// offset
+            requiredMemory[i] = sum ;
         }
+        return requiredMemory ;
+    }
+
+    void readDaughterPredict(G* ptr){
+        readDaughterPredict(ptr,0,nParticles);
+    }
+
+    void readDaughterPredict(G* ptr, int startIdx,int endIdx){
+        nvtxRangeId_t rId = nvtxRangeStartA("readDaughterPredict") ;
+        for ( int i = startIdx ; i < endIdx ; i++){
+            int n = daughter[i].size() ;
+            daughter[i].resize(n) ;
+//            DEBUG_VAL(i) ;
+            gpuErrchk(cudaMemcpy(daughter[i].data(),ptr,
+                                 n*sizeof(G),cudaMemcpyDeviceToHost)) ;
+            ptr += n ;
+        }
+        nvtxRangeEnd(rId);
+    }
+
+    void readDaughterUpdate(G* ptr){
+        readDaughterUpdate(ptr,0,nParticles);
+    }
+
+    void readDaughterUpdate(G* ptr, int startIdx,int endIdx){
+        nvtxRangeId_t rId = nvtxRangeStartA("readDaughterUpdate") ;
+        int nPredict = 0 ;
+        for (int i = startIdx ; i < endIdx ; i++){
+            nPredict += daughter[i].size() ;
+        }
+        int nUpdate = nPredict*(nMeasure+1) + (endIdx-startIdx)*nMeasure ;
+        concat.resize(nUpdate);
+        gpuErrchk(cudaMemcpy(concat.data(),ptr,
+                             nUpdate*sizeof(G),
+                             cudaMemcpyDeviceToHost)) ;
+
+        typename vector<G>::iterator it = concat.begin() ;
+        for ( int i = startIdx ; i < endIdx ; i++){
+            int n = daughter[i].size()*(nMeasure+1) + nMeasure ;
+            daughter[i].resize(n) ;
+            daughter[i].assign(it,it+n) ;
+            it += n ;
+//            DEBUG_VAL(i) ;
+//            gpuErrchk(cudaMemcpy(daughter[i].data(),ptr,
+//                                 n*sizeof(G),cudaMemcpyDeviceToHost)) ;
+//            ptr += n ;
+        }
+        nvtxRangeEnd(rId);
     }
 
     void predictParent(){
