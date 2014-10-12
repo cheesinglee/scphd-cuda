@@ -364,7 +364,7 @@ computeMahalDist(Gaussian<N,N2> a, Gaussian<N,N2> b){
 template <int N, int M,int N2=N*N, int M2=M*M, int MN=M*N>
 __device__ __host__ Gaussian<N,N2>
 ekfUpdate(Gaussian<N,N2> predicted,double* innovation,double* H,double* R){
-    // S = HPH^T
+    // S = HPH^T + R
     double S[M2] ;
     double HP[MN] ;
     double Ht[MN] ;
@@ -372,6 +372,9 @@ ekfUpdate(Gaussian<N,N2> predicted,double* innovation,double* H,double* R){
     transpose<M,N>(H,Ht) ;
     matmultiply<M,N,N>(H,predicted.cov,HP) ;
     matmultiply<M,N,M>(HP,Ht,S) ;
+    for (int i = 0 ; i < N2 ; i++){
+        S[i] += R[i] ;
+    }
 
     // K = P*H^T*S^-1
     double K[MN] ;
